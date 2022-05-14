@@ -8,21 +8,14 @@ import (
 	"time"
 )
 
-func clientDial(ctx context.Context, dialer Dialer, conn *connection, message *message) {
+// 客户端发起需要代理的请求
+func clientDial(ctx context.Context, conn *connection, message *Message) {
 	defer conn.Close()
 
-	var (
-		netConn net.Conn
-		err     error
-	)
-
 	ctx, cancel := context.WithDeadline(ctx, time.Now().Add(time.Minute))
-	if dialer == nil {
-		d := net.Dialer{}
-		netConn, err = d.DialContext(ctx, message.proto, message.address)
-	} else {
-		netConn, err = dialer(ctx, message.proto, message.address)
-	}
+
+	d := net.Dialer{}
+	netConn, err := d.DialContext(ctx, message.Proto, message.Address)
 	cancel()
 
 	if err != nil {
@@ -38,7 +31,7 @@ func pipe(client *connection, server net.Conn) {
 	wg := sync.WaitGroup{}
 	wg.Add(1)
 
-	close := func(err error) error {
+	closeFunc := func(err error) error {
 		if err == nil {
 			err = io.EOF
 		}
@@ -49,12 +42,13 @@ func pipe(client *connection, server net.Conn) {
 
 	go func() {
 		defer wg.Done()
-		_, err := io.Copy(server, client)
-		close(err)
+
+		_, err := io.Copy(server, client) // 发送请求
+		closeFunc(err)
 	}()
 
-	_, err := io.Copy(client, server)
-	err = close(err)
+	_, err := io.Copy(client, server) // 接收相应
+	err = closeFunc(err)
 	wg.Wait()
 
 	// Write tunnel error after no more I/O is happening, just incase messages get out of order

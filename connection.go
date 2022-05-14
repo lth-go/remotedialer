@@ -4,15 +4,11 @@ import (
 	"io"
 	"net"
 	"time"
-
-	"github.com/rancher/remotedialer/metrics"
-	"github.com/sirupsen/logrus"
 )
 
 type connection struct {
 	err           error
 	writeDeadline time.Time
-	backPressure  *backPressure
 	buffer        *readBuffer
 	addr          addr
 	session       *Session
@@ -28,14 +24,11 @@ func newConnection(connID int64, session *Session, proto, address string) *conne
 		connID:  connID,
 		session: session,
 	}
-	c.backPressure = newBackPressure(c)
-	c.buffer = newReadBuffer(connID, c.backPressure)
-	metrics.IncSMTotalAddConnectionsForWS(session.clientKey, proto, address)
+	c.buffer = newReadBuffer(connID)
 	return c
 }
 
 func (c *connection) tunnelClose(err error) {
-	metrics.IncSMTotalRemoveConnectionsForWS(c.session.clientKey, c.addr.Network(), c.addr.String())
 	c.writeErr(err)
 	c.doTunnelClose(err)
 }
@@ -53,63 +46,31 @@ func (c *connection) doTunnelClose(err error) {
 	c.buffer.Close(c.err)
 }
 
-func (c *connection) OnData(m *message) error {
-	if PrintTunnelData {
-		defer func() {
-			logrus.Debugf("ONDATA  [%d] %s", c.connID, c.buffer.Status())
-		}()
-	}
-	return c.buffer.Offer(m.body)
+func (c *connection) OnData(m *Message) error {
+	return c.buffer.Write(m.Bytes)
 }
 
 func (c *connection) Close() error {
 	c.session.closeConnection(c.connID, io.EOF)
-	c.backPressure.Close()
 	return nil
 }
 
 func (c *connection) Read(b []byte) (int, error) {
-	n, err := c.buffer.Read(b)
-	metrics.AddSMTotalReceiveBytesOnWS(c.session.clientKey, float64(n))
-	if PrintTunnelData {
-		logrus.Debugf("READ    [%d] %s %d %v", c.connID, c.buffer.Status(), n, err)
-	}
-	return n, err
+	return c.buffer.Read(b)
 }
 
 func (c *connection) Write(b []byte) (int, error) {
 	if c.err != nil {
 		return 0, io.ErrClosedPipe
 	}
-	c.backPressure.Wait()
 	msg := newMessage(c.connID, b)
-	metrics.AddSMTotalTransmitBytesOnWS(c.session.clientKey, float64(len(msg.Bytes())))
-	return c.session.writeMessage(c.writeDeadline, msg)
-}
-
-func (c *connection) OnPause() {
-	c.backPressure.OnPause()
-}
-
-func (c *connection) OnResume() {
-	c.backPressure.OnResume()
-}
-
-func (c *connection) Pause() {
-	msg := newPause(c.connID)
-	_, _ = c.session.writeMessage(c.writeDeadline, msg)
-}
-
-func (c *connection) Resume() {
-	msg := newResume(c.connID)
-	_, _ = c.session.writeMessage(c.writeDeadline, msg)
+	return c.session.writeMessage(msg)
 }
 
 func (c *connection) writeErr(err error) {
 	if err != nil {
 		msg := newErrorMessage(c.connID, err)
-		metrics.AddSMTotalTransmitErrorBytesOnWS(c.session.clientKey, float64(len(msg.Bytes())))
-		c.session.writeMessage(c.writeDeadline, msg)
+		c.session.writeMessage(msg)
 	}
 }
 

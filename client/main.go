@@ -2,32 +2,29 @@ package main
 
 import (
 	"context"
-	"flag"
-	"net/http"
+	"log"
 
 	"github.com/rancher/remotedialer"
-	"github.com/sirupsen/logrus"
-)
-
-var (
-	addr  string
-	id    string
-	debug bool
+	"github.com/rancher/remotedialer/api/proxy"
+	"github.com/rancher/remotedialer/dummy"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
 func main() {
-	flag.StringVar(&addr, "connect", "ws://localhost:8123/connect", "Address to connect to")
-	flag.StringVar(&id, "id", "foo", "Client ID")
-	flag.BoolVar(&debug, "debug", true, "Debug logging")
-	flag.Parse()
+	var opts []grpc.DialOption
+	opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()))
 
-	if debug {
-		logrus.SetLevel(logrus.DebugLevel)
+	conn, err := grpc.Dial(":8123", opts...)
+	if err != nil {
+		log.Fatalf("fail to dial: %v", err)
+	}
+	defer conn.Close()
+
+	stream, err := proxy.NewProxyServiceClient(conn).ProxyStream(context.Background())
+	if err != nil {
+		log.Fatalf("rpc error: %s", err)
 	}
 
-	headers := http.Header{
-		"X-Tunnel-ID": []string{id},
-	}
-
-	remotedialer.ClientConnect(context.Background(), addr, headers, nil, func(string, string) bool { return true }, nil)
+	remotedialer.ClientConnect(context.Background(), dummy.NewGrpcStreamTunnel(stream))
 }

@@ -1,19 +1,22 @@
 package main
 
 import (
-	"flag"
 	"fmt"
 	"io"
+	"log"
+	"net"
 	"net/http"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/mux"
 	"github.com/rancher/remotedialer"
+	"github.com/rancher/remotedialer/api/proxy"
+	"github.com/rancher/remotedialer/dummy"
 	"github.com/sirupsen/logrus"
+	"google.golang.org/grpc"
 )
 
 var (
@@ -22,9 +25,9 @@ var (
 	counter int64
 )
 
-func authorizer(req *http.Request) (string, bool, error) {
-	id := req.Header.Get("x-tunnel-id")
-	return id, id != "", nil
+func DefaultErrorWriter(rw http.ResponseWriter, req *http.Request, code int, err error) {
+	rw.WriteHeader(code)
+	rw.Write([]byte(err.Error()))
 }
 
 func Client(server *remotedialer.Server, rw http.ResponseWriter, req *http.Request) {
@@ -44,7 +47,7 @@ func Client(server *remotedialer.Server, rw http.ResponseWriter, req *http.Reque
 	resp, err := client.Get(url)
 	if err != nil {
 		logrus.Errorf("[%03d] REQ ERR t=%s %s: %v", id, timeout, url, err)
-		remotedialer.DefaultErrorWriter(rw, req, 500, err)
+		DefaultErrorWriter(rw, req, 500, err)
 		return
 	}
 	defer resp.Body.Close()
@@ -82,44 +85,60 @@ func getClient(server *remotedialer.Server, clientKey, timeout string) *http.Cli
 	return client
 }
 
-func main() {
-	var (
-		addr      string
-		peerID    string
-		peerToken string
-		peers     string
-		debug     bool
-	)
-	flag.StringVar(&addr, "listen", ":8123", "Listen address")
-	flag.StringVar(&peerID, "id", "", "Peer ID")
-	flag.StringVar(&peerToken, "token", "", "Peer Token")
-	flag.StringVar(&peers, "peers", "", "Peers format id:token:url,id:token:url")
-	flag.BoolVar(&debug, "debug", false, "Enable debug logging")
-	flag.Parse()
+type proxyService struct {
+	remoteDialerServer *remotedialer.Server
+	proxy.UnimplementedProxyServiceServer
+}
 
-	if debug {
-		logrus.SetLevel(logrus.DebugLevel)
-		remotedialer.PrintTunnelData = true
+func newProxyServer(server *remotedialer.Server) *proxyService {
+	return &proxyService{
+		remoteDialerServer: server,
+	}
+}
+
+func (s *proxyService) ProxyStream(stream proxy.ProxyService_ProxyStreamServer) error {
+	clientKey := "foo"
+
+	fmt.Println("get connect")
+	defer fmt.Println("lose connect")
+
+	conn := dummy.NewGrpcStreamTunnel(stream)
+
+	session := s.remoteDialerServer.SessionAdd(clientKey, conn)
+	defer s.remoteDialerServer.SessionRemove(session)
+
+	err := session.Serve(stream.Context())
+	if err != nil {
+		return err
 	}
 
-	handler := remotedialer.New(authorizer, remotedialer.DefaultErrorWriter)
-	handler.PeerToken = peerToken
-	handler.PeerID = peerID
+	return nil
+}
 
-	for _, peer := range strings.Split(peers, ",") {
-		parts := strings.SplitN(strings.TrimSpace(peer), ":", 3)
-		if len(parts) != 3 {
-			continue
-		}
-		handler.AddPeer(parts[2], parts[0], parts[1])
+func runGrpc(server *remotedialer.Server) {
+	lis, err := net.Listen("tcp", ":8123")
+	if err != nil {
+		log.Fatalf("failed to listen: %v", err)
 	}
 
+	grpcServer := grpc.NewServer()
+	proxy.RegisterProxyServiceServer(grpcServer, newProxyServer(server))
+	grpcServer.Serve(lis)
+}
+
+func runHttp(remoteDialerServer *remotedialer.Server) {
 	router := mux.NewRouter()
-	router.Handle("/connect", handler)
 	router.HandleFunc("/client/{id}/{scheme}/{host}{path:.*}", func(rw http.ResponseWriter, req *http.Request) {
-		Client(handler, rw, req)
+		Client(remoteDialerServer, rw, req)
 	})
 
-	fmt.Println("Listening on ", addr)
-	http.ListenAndServe(addr, router)
+	http.ListenAndServe(":8080", router)
+}
+
+func main() {
+	remoteDialerServer := remotedialer.New()
+
+	go runGrpc(remoteDialerServer)
+
+	runHttp(remoteDialerServer)
 }

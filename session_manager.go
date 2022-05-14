@@ -6,28 +6,16 @@ import (
 	"math/rand"
 	"net"
 	"sync"
-
-	"github.com/gorilla/websocket"
-	"github.com/rancher/remotedialer/metrics"
 )
-
-type sessionListener interface {
-	sessionAdded(clientKey string, sessionKey int64)
-	sessionRemoved(clientKey string, sessionKey int64)
-}
 
 type sessionManager struct {
 	sync.Mutex
-	clients   map[string][]*Session
-	peers     map[string][]*Session
-	listeners map[sessionListener]bool
+	clients map[string][]*Session
 }
 
 func newSessionManager() *sessionManager {
 	return &sessionManager{
-		clients:   map[string][]*Session{},
-		peers:     map[string][]*Session{},
-		listeners: map[sessionListener]bool{},
+		clients: map[string][]*Session{},
 	}
 }
 
@@ -40,32 +28,6 @@ func toDialer(s *Session, prefix string) Dialer {
 	}
 }
 
-func (sm *sessionManager) removeListener(listener sessionListener) {
-	sm.Lock()
-	defer sm.Unlock()
-
-	delete(sm.listeners, listener)
-}
-
-func (sm *sessionManager) addListener(listener sessionListener) {
-	sm.Lock()
-	defer sm.Unlock()
-
-	sm.listeners[listener] = true
-
-	for k, sessions := range sm.clients {
-		for _, session := range sessions {
-			listener.sessionAdded(k, session.sessionKey)
-		}
-	}
-
-	for k, sessions := range sm.peers {
-		for _, session := range sessions {
-			listener.sessionAdded(k, session.sessionKey)
-		}
-	}
-}
-
 func (sm *sessionManager) getDialer(clientKey string) (Dialer, error) {
 	sm.Lock()
 	defer sm.Unlock()
@@ -75,71 +37,40 @@ func (sm *sessionManager) getDialer(clientKey string) (Dialer, error) {
 		return toDialer(sessions[0], ""), nil
 	}
 
-	for _, sessions := range sm.peers {
-		for _, session := range sessions {
-			session.Lock()
-			keys := session.remoteClientKeys[clientKey]
-			session.Unlock()
-			if len(keys) > 0 {
-				return toDialer(session, clientKey), nil
-			}
-		}
-	}
-
 	return nil, fmt.Errorf("failed to find Session for client %s", clientKey)
 }
 
-func (sm *sessionManager) add(clientKey string, conn *websocket.Conn, peer bool) *Session {
+func (sm *sessionManager) add(clientKey string, conn Tunnel) *Session {
 	sessionKey := rand.Int63()
 	session := newSession(sessionKey, clientKey, conn)
 
 	sm.Lock()
 	defer sm.Unlock()
 
-	if peer {
-		sm.peers[clientKey] = append(sm.peers[clientKey], session)
-	} else {
-		sm.clients[clientKey] = append(sm.clients[clientKey], session)
-	}
-	metrics.IncSMTotalAddWS(clientKey, peer)
-
-	for l := range sm.listeners {
-		l.sessionAdded(clientKey, session.sessionKey)
-	}
+	sm.clients[clientKey] = append(sm.clients[clientKey], session)
 
 	return session
 }
 
 func (sm *sessionManager) remove(s *Session) {
-	var isPeer bool
 	sm.Lock()
 	defer sm.Unlock()
 
-	for i, store := range []map[string][]*Session{sm.clients, sm.peers} {
-		var newSessions []*Session
+	store := sm.clients
 
-		for _, v := range store[s.clientKey] {
-			if v.sessionKey == s.sessionKey {
-				if i == 0 {
-					isPeer = false
-				} else {
-					isPeer = true
-				}
-				metrics.IncSMTotalRemoveWS(s.clientKey, isPeer)
-				continue
-			}
-			newSessions = append(newSessions, v)
-		}
+	var newSessions []*Session
 
-		if len(newSessions) == 0 {
-			delete(store, s.clientKey)
-		} else {
-			store[s.clientKey] = newSessions
+	for _, v := range store[s.clientKey] {
+		if v.sessionKey == s.sessionKey {
+			continue
 		}
+		newSessions = append(newSessions, v)
 	}
 
-	for l := range sm.listeners {
-		l.sessionRemoved(s.clientKey, s.sessionKey)
+	if len(newSessions) == 0 {
+		delete(store, s.clientKey)
+	} else {
+		store[s.clientKey] = newSessions
 	}
 
 	s.Close()

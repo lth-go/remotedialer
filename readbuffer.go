@@ -3,12 +3,9 @@ package remotedialer
 import (
 	"bytes"
 	"errors"
-	"fmt"
 	"io"
 	"sync"
 	"time"
-
-	"github.com/sirupsen/logrus"
 )
 
 const (
@@ -16,31 +13,23 @@ const (
 )
 
 type readBuffer struct {
-	id, readCount, offerCount int64
-	cond                      sync.Cond
-	deadline                  time.Time
-	buf                       bytes.Buffer
-	err                       error
-	backPressure              *backPressure
+	id       int64
+	cond     sync.Cond
+	deadline time.Time
+	buf      bytes.Buffer
+	err      error
 }
 
-func newReadBuffer(id int64, backPressure *backPressure) *readBuffer {
+func newReadBuffer(id int64) *readBuffer {
 	return &readBuffer{
-		id:           id,
-		backPressure: backPressure,
+		id: id,
 		cond: sync.Cond{
 			L: &sync.Mutex{},
 		},
 	}
 }
 
-func (r *readBuffer) Status() string {
-	r.cond.L.Lock()
-	defer r.cond.L.Unlock()
-	return fmt.Sprintf("%d/%d", r.readCount, r.offerCount)
-}
-
-func (r *readBuffer) Offer(reader io.Reader) error {
+func (r *readBuffer) Write(data []byte) error {
 	r.cond.L.Lock()
 	defer r.cond.L.Unlock()
 
@@ -48,20 +37,12 @@ func (r *readBuffer) Offer(reader io.Reader) error {
 		return r.err
 	}
 
+	reader := bytes.NewReader(data)
+
 	if n, err := io.Copy(&r.buf, reader); err != nil {
-		r.offerCount += n
 		return err
 	} else if n > 0 {
-		r.offerCount += n
 		r.cond.Broadcast()
-	}
-
-	if r.buf.Len() > MaxBuffer {
-		r.backPressure.Pause()
-	}
-
-	if r.buf.Len() > MaxBuffer*2 {
-		logrus.Errorf("remotedialer buffer exceeded id=%d, length: %d", r.id, r.buf.Len())
 	}
 
 	return nil
@@ -80,16 +61,11 @@ func (r *readBuffer) Read(b []byte) (int, error) {
 				// that here.
 				panic("bytes.Buffer returned err=\"" + err.Error() + "\" when buffer length was > 0")
 			}
-			r.readCount += int64(n)
 			r.cond.Broadcast()
-			if r.buf.Len() < MaxBuffer/8 {
-				r.backPressure.Resume()
-			}
 			return n, nil
 		}
 
 		if r.buf.Cap() > MaxBuffer/8 {
-			logrus.Debugf("resetting remotedialer buffer id=%d to zero, old cap %d", r.id, r.buf.Cap())
 			r.buf = bytes.Buffer{}
 		}
 
@@ -118,9 +94,12 @@ func (r *readBuffer) Read(b []byte) (int, error) {
 func (r *readBuffer) Close(err error) error {
 	r.cond.L.Lock()
 	defer r.cond.L.Unlock()
+
 	if r.err == nil {
 		r.err = err
 	}
+
 	r.cond.Broadcast()
+
 	return nil
 }

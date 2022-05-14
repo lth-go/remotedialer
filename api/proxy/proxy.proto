@@ -1,0 +1,15 @@
+syntax = "proto3";
+
+option go_package = "github.com/rancher/remotedialer/api/proxy";
+
+package proxy;
+
+// Interface exported by the server.
+service ProxyService {
+  rpc ProxyStream(stream ProxyMessage) returns (stream ProxyMessage) {}
+}
+
+message ProxyMessage {
+  string msg_type = 1;
+  bytes  data     = 2;
+}
